@@ -158,7 +158,7 @@ def gerar_pdf(dados, resultados, modelo=MODELO):
         for campo,valor in [('Assinatura do responsável',dados['empresa']),('Entidade',dados['entidade']),('Próximo Reajuste',dados['reajuste']),('Local e Data',dados['local_data'])]:
             escrever(capa,rects[campo],valor,12,bold=True)
         escrever(capa,(311,592,543,617),dados.get('executivo',''),11)
-        escrever(capa,(54,436,538,461),f'{regime.upper()} | {produto} - {codigo}',12,bold=True,cor=(0.25,0.43,0.19))
+        escrever(capa,(54,436,538,461),dados.get('titulo_capa') or f'{regime.upper()} | {produto} - {codigo}',12,bold=True,cor=(0.25,0.43,0.19))
         escrever(capa,(54,645,538,668),dados.get('modo',''),10,cor=(0.25,0.43,0.19))
         pg=doc[pagina]; mapas=[mapa_tabela(pg,dupla,i) for i in range(len(opcoes))]
         for w in list(pg.widgets()): pg.delete_widget(w)
@@ -181,3 +181,58 @@ def gerar_pdf(dados, resultados, modelo=MODELO):
             escrever(pg,econ[1],br(r['anual']),9,bold=True)
         doc.select(list(range(6))+[pagina]+list(range(12,17)))
         return doc.tobytes(garbage=4,deflate=True)
+
+CHAVES_TOTAIS = ('vidas','bruto','economia','liquido','anual')
+
+
+def totalizar_contratos(contratos, cumulativos=True):
+    """Não soma cenários alternativos nem acomodações com as mesmas vidas."""
+    if not contratos or not cumulativos or any(c.get('comparar') for c in contratos):
+        return None
+    return {k:sum(r[k] for c in contratos for r in c['resultados'].values()) for k in CHAVES_TOTAIS}
+
+
+def validar_contratos(contratos):
+    if not contratos:
+        raise ValueError('Inclua pelo menos um contrato.')
+    for i,c in enumerate(contratos,1):
+        if c['codigo'] not in PRODUTOS.get(c['regime'],{}):
+            raise ValueError(f'Contrato {i}: produto inválido.')
+        if not c['entidade'].strip() or not c['reajuste'].strip():
+            raise ValueError(f'Contrato {i}: entidade e próximo reajuste são obrigatórios.')
+        rs=c['resultados']; permitidas=acomodacoes(PRODUTOS[c['regime']][c['codigo']])
+        if not rs or any(a not in permitidas or not r['vidas'] for a,r in rs.items()):
+            raise ValueError(f'Contrato {i}: acomodações ou vidas inválidas.')
+        if c.get('comparar'):
+            if set(rs)!={'Enfermaria','Apartamento'} or [l[0] for l in rs['Enfermaria']['linhas']] != [l[0] for l in rs['Apartamento']['linhas']]:
+                raise ValueError(f'Contrato {i}: a comparação exige as mesmas vidas nas duas acomodações.')
+
+
+def gerar_pdf_contratos(dados, contratos, cumulativos=True, modelo=MODELO):
+    """Uma capa, conteúdo institucional e condições uma vez, uma tabela por contrato."""
+    validar_contratos(contratos)
+    if len(contratos)==1:
+        c=contratos[0]
+        d={**dados,**{k:c[k] for k in ('regime','codigo','entidade','reajuste')},'modo': 'Comparação de acomodações - mesmas vidas' if c.get('comparar') else ('Vidas distribuídas por acomodação' if len(c['resultados'])==2 else '')}
+        if c.get('referencia'): d['modo']=' | '.join(x for x in [d['modo'], 'Ref.: '+c['referencia']] if x)
+        return gerar_pdf(d,c['resultados'],modelo)
+    with fitz.open() as out:
+        for i,c in enumerate(contratos,1):
+            d={**dados,**{k:c[k] for k in ('regime','codigo','entidade','reajuste')},'modo':''}
+            if i==1:
+                # Gerar capa de múltiplos contratos sem atribuir um produto a todos.
+                d['entidade']=c['entidade'] if len({x['entidade'] for x in contratos})==1 else 'Conforme contratos'
+                d['reajuste']=c['reajuste'] if len({x['reajuste'] for x in contratos})==1 else 'Conforme contratos'
+                d['titulo_capa']=f'{len(contratos)} CONTRATOS | {"CONTRATAÇÃO CONJUNTA" if cumulativos else "CENÁRIOS ALTERNATIVOS"}'
+            with fitz.open(stream=gerar_pdf(d,c['resultados'],modelo),filetype='pdf') as single:
+                if i==1:
+                    out.insert_pdf(single,from_page=0,to_page=5)
+                p=single[6]
+                # Identificação de cada contrato no próprio cabeçalho, sem página de resumo.
+                escrever(p,(28,1,567,12),f'Contrato {i:02d} | {c["regime"]} | Código {c["codigo"]}',9,bold=True,cor=(.25,.43,.19))
+                escrever(p,(28,12,567,23),f'Entidade: {c["entidade"]} | Reajuste: {c["reajuste"]}',8.5)
+                detalhe=' | '.join(x for x in [f'Ref.: {c["referencia"]}' if c.get('referencia') else '', 'Comparação de acomodações - mesmas vidas' if c.get('comparar') else ('Contratos alternativos - não somar' if not cumulativos else '')] if x)
+                escrever(p,(28,23,567,33),detalhe,8)
+                out.insert_pdf(single,from_page=6,to_page=6)
+                if i==len(contratos): out.insert_pdf(single,from_page=7,to_page=11)
+        return out.tobytes(garbage=4,deflate=True)
